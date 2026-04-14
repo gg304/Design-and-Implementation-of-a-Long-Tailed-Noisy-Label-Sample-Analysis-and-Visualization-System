@@ -71,6 +71,7 @@ H:\PY\Project\
         ├── resnet18-f37072fd.pth
         ├── resnet34-b627a593.pth
         └── resnet50-0676ba61.pth
+
 常见问题：
 问题	解决方法
 数据集下载	https://www.cs.toronto.edu/~kriz/cifar.html可从该网址选取下载放入 ./data/ 目录
