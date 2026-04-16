@@ -288,11 +288,10 @@ def generate_synthetic_data(num_samples=200, num_classes=10, imbalance=0.1, nois
 
 
 # ==================== TABASCO 噪声检测器 ====================
-
 from sklearn.mixture import GaussianMixture
 
 class TABASCODetector:
-    """TABASCO 两阶段样本选择"""
+    """TABASCO 两阶段样本选择 - 完整实现"""
 
     def __init__(self, num_classes):
         self.num_classes = num_classes
@@ -302,6 +301,7 @@ class TABASCODetector:
         n_samples = len(probabilities)
         wjsd_scores = np.zeros(n_samples)
 
+        # 计算各类别平均预测分布
         class_avg = []
         for c in range(self.num_classes):
             mask = labels == c
@@ -330,6 +330,7 @@ class TABASCODetector:
         n_samples = len(features)
         acd_scores = np.zeros(n_samples)
 
+        # 计算各类别质心
         class_centroids = []
         for c in range(self.num_classes):
             mask = labels == c
@@ -359,78 +360,118 @@ class TABASCODetector:
 
         return acd_scores
 
+    def _dimension_selection(self, wjsd_scores, acd_scores):
+        """
+        维度选择策略（完整实现）
+        返回: 选定的分数数组, 是否使用WJSD的标志
+        """
+        # 使用GMM基于WJSD聚簇，得到分离阈值d
+        wjsd_reshaped = wjsd_scores.reshape(-1, 1)
+        gmm_wjsd = GaussianMixture(n_components=2, random_state=42)
+        gmm_wjsd.fit(wjsd_reshaped)
+
+        # 获取两个簇的均值，计算分离阈值d（两个簇均值的中点）
+        means_wjsd = gmm_wjsd.means_.flatten()
+        d = (means_wjsd[0] + means_wjsd[1]) / 2
+
+        # 使用GMM基于ACD聚簇
+        acd_reshaped = acd_scores.reshape(-1, 1)
+        gmm_acd = GaussianMixture(n_components=2, random_state=42)
+        cluster_labels_acd = gmm_acd.fit_predict(acd_reshaped)
+
+        # 计算ACD两个簇在WJSD维度上的均值和方差
+        cluster0_mask = (cluster_labels_acd == 0)
+        cluster1_mask = (cluster_labels_acd == 1)
+
+        wjsd_cluster0 = wjsd_scores[cluster0_mask]
+        wjsd_cluster1 = wjsd_scores[cluster1_mask]
+
+        mu1 = wjsd_cluster0.mean() if len(wjsd_cluster0) > 0 else np.inf
+        mu2 = wjsd_cluster1.mean() if len(wjsd_cluster1) > 0 else np.inf
+        sigma1 = wjsd_cluster0.std() if len(wjsd_cluster0) > 0 else np.inf
+        sigma2 = wjsd_cluster1.std() if len(wjsd_cluster1) > 0 else np.inf
+
+        # 维度选择规则（参考TABASCO原论文算法1）
+        eta = 0.5  # 预设阈值
+
+        # 情况1：一个簇的均值小于d，另一个大于d，且方差比满足条件
+        if (mu1 < d < mu2 or mu2 < d < mu1) and (sigma2 / sigma1 < eta or sigma1 / sigma2 < eta):
+            return wjsd_scores, True   # 选择WJSD
+
+        # 情况2：两个簇的均值都大于d（尾部类别情况）
+        if mu1 > d and mu2 > d:
+            return wjsd_scores, True   # 选择WJSD
+
+        # 其他情况：选择ACD
+        return acd_scores, False
+
     def detect(self, probabilities, features, labels, confidences):
-        """两阶段样本选择 - 包含维度和聚簇选择"""
+        """
+        两阶段样本选择 - 完整检测流程
+        返回: sample_types (0=高可信, 1=低可信, 2=疑似噪声), wjsd, acd
+        """
         n_samples = len(labels)
 
         # ========== 第一阶段：计算双度量 ==========
         wjsd = self.compute_wjsd(probabilities, labels)
         acd = self.compute_acd(features, labels, confidences)
 
-        # 归一化
+        # 归一化到[0,1]区间
         wjsd = (wjsd - wjsd.min()) / (wjsd.max() - wjsd.min() + 1e-8)
         acd = (acd - acd.min()) / (acd.max() - acd.min() + 1e-8)
 
         sample_types = np.zeros(n_samples, dtype=int)
 
-        # ========== 第二阶段：维度和聚簇选择 ==========
+        # ========== 第二阶段：对每个类别独立处理 ==========
         for c in range(self.num_classes):
             mask = labels == c
             if mask.sum() == 0:
                 continue
 
             idx = np.where(mask)[0]
-            c_wjsd = wjsd[idx].reshape(-1, 1)
-            c_acd = acd[idx].reshape(-1, 1)
+            c_wjsd = wjsd[idx]
+            c_acd = acd[idx]
 
-            # ----- 步骤1：维度选择（比较方差）-----
-            if np.var(c_wjsd) > np.var(c_acd):
-                # 选择WJSD维度
-                scores = c_wjsd.flatten()
-                use_wjsd = True
-            else:
-                # 选择ACD维度
-                scores = c_acd.flatten()
-                use_wjsd = False
+            # ----- 步骤1：维度选择 -----
+            scores, use_wjsd = self._dimension_selection(c_wjsd, c_acd)
 
-            # ----- 步骤2：聚簇选择（GMM聚类）-----
-            # 使用高斯混合模型将样本分成两个簇
+            # ----- 步骤2：GMM聚簇选择 -----
+            scores_reshaped = scores.reshape(-1, 1)
             gmm = GaussianMixture(n_components=2, random_state=42)
-            cluster_labels = gmm.fit_predict(scores.reshape(-1, 1))
+            cluster_labels = gmm.fit_predict(scores_reshaped)
 
             # 计算两个簇的平均分数
             mean0 = scores[cluster_labels == 0].mean() if np.sum(cluster_labels == 0) > 0 else np.inf
             mean1 = scores[cluster_labels == 1].mean() if np.sum(cluster_labels == 1) > 0 else np.inf
 
-            # 判断哪个簇是干净样本簇
-            if use_wjsd:
-                # 基于WJSD：平均分数小的簇是干净样本
-                clean_cluster = 0 if mean0 < mean1 else 1
-            else:
-                # 基于ACD：平均分数大的簇更可能是噪声
-                # 简化版：平均分数小的簇是干净样本
-                clean_cluster = 0 if mean0 < mean1 else 1
+            # 判断干净簇（平均分数较小的簇）
+            clean_cluster = 0 if mean0 < mean1 else 1
 
-            # ----- 步骤3：划分样本类型 -----
-            for i, pos in enumerate(idx):
-                if cluster_labels[i] == clean_cluster:
-                    # 干净簇中的样本：再根据分数分为高可信和低可信
-                    # 计算干净簇内的分位数
-                    clean_scores = scores[cluster_labels == clean_cluster]
-                    if len(clean_scores) > 0:
-                        q25_clean = np.percentile(clean_scores, 25)
+            # ----- 步骤3：样本分类 -----
+            # 获取干净簇内的分数
+            clean_mask = (cluster_labels == clean_cluster)
+            clean_scores = scores[clean_mask]
+
+            if len(clean_scores) > 0:
+                # 计算干净簇内的25%分位数
+                q25_clean = np.percentile(clean_scores, 25)
+
+                for i, pos in enumerate(idx):
+                    if cluster_labels[i] == clean_cluster:
+                        # 干净簇内：低于25%分位数为高可信，其余为低可信
                         if scores[i] <= q25_clean:
                             sample_types[pos] = 0      # 高可信
                         else:
                             sample_types[pos] = 1      # 低可信
                     else:
-                        sample_types[pos] = 1
-                else:
-                    # 噪声簇中的样本
-                    sample_types[pos] = 2              # 疑似噪声
+                        # 噪声簇内：全部为疑似噪声
+                        sample_types[pos] = 2          # 疑似噪声
+            else:
+                # 干净簇为空（异常情况），全部标为低可信
+                for pos in idx:
+                    sample_types[pos] = 1
 
         return sample_types, wjsd, acd
-
 
 # ==================== 模型管理 ====================
 
