@@ -831,68 +831,99 @@ def main():
                         st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
 
-            # 批量操作
+            # ========== 修复：批量操作区域 ==========
+            st.markdown("---")
+            st.subheader("批量操作")
+
             col1, col2 = st.columns(2)
+
             with col1:
+                # 修复：先检查再操作，操作后只显示成功消息，不自动刷新
                 if st.button("将所有疑似噪声改为预测标签"):
-                    noise_indices = np.where(st.session_state.sample_types == 2)[0]
-                    if len(noise_indices) > 0 and st.session_state.predictions is not None:
-                        for idx in noise_indices:
-                            st.session_state.modified_labels[idx] = st.session_state.predictions[idx]
-                        st.success(f"已将 {len(noise_indices)} 个疑似噪声样本改为预测标签")
-                        st.rerun()
-                    else:
-                        if len(noise_indices) == 0:
-                            st.warning("没有疑似噪声样本")
+                    if st.session_state.predictions is not None:
+                        noise_indices = np.where(st.session_state.sample_types == 2)[0]
+                        if len(noise_indices) > 0:
+                            modified_count = 0
+                            for idx in noise_indices:
+                                # 确保索引在范围内
+                                if idx < len(st.session_state.modified_labels) and idx < len(st.session_state.predictions):
+                                    old_label = st.session_state.modified_labels[idx]
+                                    new_label = st.session_state.predictions[idx]
+                                    st.session_state.modified_labels[idx] = new_label
+                                    if old_label != new_label:
+                                        modified_count += 1
+
+                            # 使用临时消息而不是 rerun，避免状态丢失
+                            st.toast(f"✅ 已将 {modified_count} 个疑似噪声样本改为预测标签", icon="✅")
+                            # 注意：这里不用 st.rerun()，让页面自然更新
                         else:
-                            st.warning("预测标签为空，请先运行检测")
+                            st.warning("没有疑似噪声样本")
+                    else:
+                        st.warning("预测标签为空，请先运行检测")
+
             with col2:
                 if st.button("重置所有修改"):
+                    # 修复：使用原始标签的副本，而不是引用
                     st.session_state.modified_labels = st.session_state.labels.copy()
-                    st.success("已重置所有修改")
-                    st.rerun()
+                    st.toast("✅ 已重置所有修改", icon="🔄")
+                    # 同样不自动刷新
 
-            # 导出结果
-            if st.button("导出结果"):
+            # 添加一个手动刷新按钮，让用户控制
+            if st.button("🔄 刷新页面", key="refresh_btn"):
+                st.rerun()
+
+            st.markdown("---")
+
+            # 导出结果区域
+            st.subheader("📥 导出分析结果")
+
+            # 修复：导出时重新构建 DataFrame，确保使用最新的 modified_labels
+            if st.button("生成导出文件", key="export_btn"):
                 sample_ids = [s['id'] for s in st.session_state.samples]
 
+                # 确保所有数组长度一致
+                n_samples = len(sample_ids)
+
+                # 安全获取真实标签
                 if st.session_state.true_labels is not None:
-                    true_labels_str = [st.session_state.class_names[l] for l in st.session_state.true_labels]
+                    true_labels_str = [st.session_state.class_names[l] for l in st.session_state.true_labels[:n_samples]]
+                    is_noise = [st.session_state.labels[i] != st.session_state.true_labels[i] for i in range(n_samples)]
                 else:
-                    true_labels_str = [None] * len(sample_ids)
+                    true_labels_str = [None] * n_samples
+                    is_noise = [False] * n_samples
 
-                current_labels = [st.session_state.class_names[l] for l in st.session_state.labels]
-                modified_labels = [st.session_state.class_names[l] for l in st.session_state.modified_labels]
+                # 当前标签（原始噪声标签）
+                current_labels = [st.session_state.class_names[l] for l in st.session_state.labels[:n_samples]]
 
+                # 修改后标签（已包含用户的所有修改）
+                modified_labels = [st.session_state.class_names[l] for l in st.session_state.modified_labels[:n_samples]]
+
+                # 预测标签
                 if st.session_state.predictions is not None:
-                    pred_labels = [st.session_state.class_names[p] for p in st.session_state.predictions]
+                    pred_labels = [st.session_state.class_names[p] for p in st.session_state.predictions[:n_samples]]
                 else:
-                    pred_labels = [None] * len(sample_ids)
+                    pred_labels = [None] * n_samples
 
+                # 置信度
                 if st.session_state.confidences is not None:
-                    confs = st.session_state.confidences
+                    confs = st.session_state.confidences[:n_samples]
                 else:
-                    confs = [None] * len(sample_ids)
+                    confs = [None] * n_samples
 
+                # 样本类型
                 if st.session_state.sample_types is not None:
-                    sample_types_str = [['高可信', '低可信', '疑似噪声'][t] for t in st.session_state.sample_types]
+                    sample_types_str = [['高可信', '低可信', '疑似噪声'][t] for t in st.session_state.sample_types[:n_samples]]
                 else:
-                    sample_types_str = [None] * len(sample_ids)
+                    sample_types_str = [None] * n_samples
 
-                if st.session_state.true_labels is not None:
-                    is_noise = [st.session_state.labels[i] != st.session_state.true_labels[i]
-                                for i in range(len(sample_ids))]
-                else:
-                    is_noise = [False] * len(sample_ids)
-                is_noise_str = ['是' if x else '否' for x in is_noise]
-
+                # 修改是否正确（仅当有真实标签时）
                 if st.session_state.true_labels is not None:
                     correction_correct = [st.session_state.modified_labels[i] == st.session_state.true_labels[i]
-                                          for i in range(len(sample_ids))]
+                                          for i in range(n_samples)]
                 else:
-                    correction_correct = [False] * len(sample_ids)
-                correction_correct_str = ['是' if x else '否' for x in correction_correct]
+                    correction_correct = [False] * n_samples
 
+                # 构建 DataFrame
                 df = pd.DataFrame({
                     '样本ID': sample_ids,
                     '真实标签': true_labels_str,
@@ -901,18 +932,24 @@ def main():
                     '预测标签': pred_labels,
                     '置信度': confs,
                     '样本类型': sample_types_str,
-                    '原始是否为噪声': is_noise_str,
-                    '修改是否正确': correction_correct_str
+                    '原始是否为噪声': ['是' if x else '否' for x in is_noise],
+                    '修改是否正确': ['是' if x else '否' for x in correction_correct]
                 })
 
-                csv = df.to_csv(index=False, encoding='utf-8-sig').encode()
+                # 保存到 session_state 供下载使用
+                st.session_state.export_df = df
+                st.success(f"✅ 已生成 {len(df)} 条记录，请点击下方按钮下载")
+
+            # 下载按钮（独立于生成按钮）
+            if st.session_state.get('export_df') is not None:
+                csv = st.session_state.export_df.to_csv(index=False, encoding='utf-8-sig').encode()
                 st.download_button(
                     "📥 下载CSV文件",
                     csv,
                     f"analysis_results_{time.strftime('%Y%m%d_%H%M%S')}.csv",
-                    "text/csv"
+                    "text/csv",
+                    key="download_csv"
                 )
-                st.success("✅ CSV文件已准备好")
         else:
             st.info("请先运行检测")
 
