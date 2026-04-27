@@ -1,6 +1,7 @@
 """
 长尾噪声标签样本分析与可视化系统
 支持多数据集动态适配 - 类名从数据集实际读取
+支持所有真实数据集的长尾采样（不平衡分布）
 """
 
 import os
@@ -18,6 +19,7 @@ import plotly.graph_objects as go
 from collections import Counter
 from scipy.special import rel_entr
 from sklearn.metrics import confusion_matrix
+from sklearn.mixture import GaussianMixture
 from PIL import Image
 import requests
 
@@ -40,13 +42,13 @@ st.markdown("""
 # ==================== 数据集加载类 ====================
 
 class DatasetLoader:
-    """数据集加载器 - 类名从数据集实际读取"""
+    """数据集加载器 - 支持长尾采样"""
 
     @staticmethod
-    def load_cifar10n(data_dir='./data', noise_type='worst', num_samples=None):
+    def load_cifar10n(data_dir='./data', noise_type='worst', num_samples=None, imbalance_ratio=None, head_samples=None):
         """
-        加载 CIFAR-10N 数据集（使用 clean_label 作为真实标签）
-        返回: samples, 噪声标签, 真实标签, 类名
+        加载 CIFAR-10N 数据集
+        支持普通随机采样和长尾采样
         """
         transform = transforms.Compose([
             transforms.ToTensor(),
@@ -61,17 +63,12 @@ class DatasetLoader:
 
         # 加载噪声标签文件
         npy_path = os.path.join(data_dir, 'CIFAR-10_human_ordered.npy')
-
         if not os.path.exists(npy_path):
             st.error(f"找不到噪声标签文件: {npy_path}")
             return None, None, None, None
 
         human_annotations = np.load(npy_path, allow_pickle=True).item()
-
-        # 使用 clean_label 作为真实标签
         clean_labels = human_annotations['clean_label']
-
-        # 获取对应的噪声标签
         label_map = {
             'aggregate': 'aggre_label',
             'random1': 'random_label1',
@@ -81,17 +78,40 @@ class DatasetLoader:
         }
         noisy_labels_all = human_annotations[label_map[noise_type]]
 
-        # 采样逻辑
+        # 原始标签（用于长尾采样）
+        original_targets = np.array(train_dataset.targets)
         total_samples = len(train_dataset)
+        num_classes = 10
 
-        if num_samples is None or num_samples >= total_samples:
-            indices = range(total_samples)
-            actual_num = total_samples
-            st.info(f"使用全部数据: {actual_num} 个样本")
+        # ========== 采样策略 ==========
+        if imbalance_ratio is not None and imbalance_ratio > 0:
+            # 长尾采样
+            head_max = head_samples if head_samples else 1000
+            class_counts = []
+            for i in range(num_classes):
+                ratio = imbalance_ratio ** (i / (num_classes - 1))
+                count = max(1, int(head_max * ratio))
+                class_counts.append(count)
+
+            indices_per_class = []
+            for c in range(num_classes):
+                class_indices = np.where(original_targets == c)[0]
+                if len(class_indices) == 0:
+                    st.error(f"类别 {c} 在原始数据中没有样本")
+                    return None, None, None, None
+                if len(class_indices) < class_counts[c]:
+                    st.warning(f"类别 {c} 原始样本不足（需要 {class_counts[c]}，实际 {len(class_indices)}），使用全部 {len(class_indices)} 个")
+                    class_counts[c] = len(class_indices)
+                indices_per_class.append(np.random.choice(class_indices, class_counts[c], replace=False))
+            indices = np.concatenate(indices_per_class)
+            st.info(f"长尾采样完成，总样本数: {len(indices)}，不平衡率: {imbalance_ratio:.3f}")
         else:
-            indices = np.random.choice(total_samples, num_samples, replace=False)
-            actual_num = num_samples
-            st.info(f"随机采样: {actual_num} 个样本")
+            # 普通随机采样
+            if num_samples is None or num_samples >= total_samples:
+                indices = range(total_samples)
+            else:
+                indices = np.random.choice(total_samples, num_samples, replace=False)
+            st.info(f"随机采样: {len(indices)} 个样本")
 
         samples = []
         labels_noisy = []
@@ -107,15 +127,17 @@ class DatasetLoader:
             labels_noisy.append(noisy_labels_all[idx] % 10)
             labels_true.append(clean_labels[idx])
 
-        # 计算并显示实际噪声率
         actual_noise_rate = (np.array(labels_noisy) != np.array(labels_true)).mean()
         st.info(f"实际噪声率: {actual_noise_rate:.2%}")
 
         return samples, np.array(labels_noisy), np.array(labels_true), class_names_display
 
     @staticmethod
-    def load_cifar100n(data_dir='./data', num_samples=None):
-        """加载 CIFAR-100N 数据集（随机采样）"""
+    def load_cifar100n(data_dir='./data', num_samples=None, imbalance_ratio=None, head_samples=None):
+        """
+        加载 CIFAR-100N 数据集
+        支持普通随机采样和长尾采样
+        """
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761))
@@ -125,12 +147,13 @@ class DatasetLoader:
             root=data_dir, train=True, download=False, transform=transform
         )
 
-        true_labels = np.array(train_dataset.targets)
+        # 原始标签（用于长尾采样）
+        original_targets = np.array(train_dataset.targets)
         class_names = train_dataset.classes
+        num_classes = 100
 
         # 加载噪声标签
         noisy_labels_path = os.path.join(data_dir, 'cifar100n.pt')
-
         if not os.path.exists(noisy_labels_path):
             url = "https://github.com/UCSC-REAL/cifar-10-100n/raw/main/data/CIFAR-100_human.pt"
             try:
@@ -139,23 +162,42 @@ class DatasetLoader:
                     f.write(response.content)
             except:
                 st.warning("无法下载噪声标签，使用原始标签")
-                noisy_labels_all = true_labels.copy()
+                noisy_labels_all = original_targets.copy()
             else:
                 noisy_labels_all = torch.load(noisy_labels_path)
         else:
             noisy_labels_all = torch.load(noisy_labels_path)
 
-        # 采样逻辑
-        total_samples = len(train_dataset)
+        # ========== 采样策略 ==========
+        if imbalance_ratio is not None and imbalance_ratio > 0:
+            # 长尾采样
+            head_max = head_samples if head_samples else 1000
+            class_counts = []
+            for i in range(num_classes):
+                ratio = imbalance_ratio ** (i / (num_classes - 1))
+                count = max(1, int(head_max * ratio))
+                class_counts.append(count)
 
-        if num_samples is None or num_samples >= total_samples:
-            indices = range(total_samples)
-            actual_num = total_samples
-            st.info(f"使用全部数据: {actual_num} 个样本")
+            indices_per_class = []
+            for c in range(num_classes):
+                class_indices = np.where(original_targets == c)[0]
+                if len(class_indices) == 0:
+                    st.error(f"类别 {c} 在原始数据中没有样本")
+                    return None, None, None, None
+                if len(class_indices) < class_counts[c]:
+                    st.warning(f"类别 {c} 原始样本不足，使用全部 {len(class_indices)} 个")
+                    class_counts[c] = len(class_indices)
+                indices_per_class.append(np.random.choice(class_indices, class_counts[c], replace=False))
+            indices = np.concatenate(indices_per_class)
+            st.info(f"长尾采样完成，总样本数: {len(indices)}，不平衡率: {imbalance_ratio:.3f}")
         else:
-            indices = np.random.choice(total_samples, num_samples, replace=False)
-            actual_num = num_samples
-            st.info(f"随机采样: {actual_num} 个样本")
+            # 普通随机采样
+            total_samples = len(train_dataset)
+            if num_samples is None or num_samples >= total_samples:
+                indices = range(total_samples)
+            else:
+                indices = np.random.choice(total_samples, num_samples, replace=False)
+            st.info(f"随机采样: {len(indices)} 个样本")
 
         samples = []
         labels_noisy = []
@@ -169,7 +211,7 @@ class DatasetLoader:
                 'class_name': class_names[noisy_labels_all[idx]]
             })
             labels_noisy.append(noisy_labels_all[idx])
-            labels_true.append(true_labels[idx])
+            labels_true.append(original_targets[idx])
 
         actual_noise_rate = (np.array(labels_noisy) != np.array(labels_true)).mean()
         st.info(f"实际噪声率: {actual_noise_rate:.2%}")
@@ -177,10 +219,12 @@ class DatasetLoader:
         return samples, np.array(labels_noisy), np.array(labels_true), class_names
 
     @staticmethod
-    def load_animal10n(data_dir='./data', num_samples=None):
-        """加载 Animal-10N 数据集"""
+    def load_animal10n(data_dir='./data', num_samples=None, imbalance_ratio=None, head_samples=None):
+        """
+        加载 Animal-10N 数据集
+        支持普通随机采样和长尾采样
+        """
         data_path = os.path.join(data_dir, 'Animal-10N')
-
         samples = []
         labels_noisy = []
         labels_true = []
@@ -191,50 +235,103 @@ class DatasetLoader:
                        if os.path.isdir(os.path.join(data_path, d))]
             subdirs.sort()
             class_names = subdirs
+            num_classes = len(class_names)
 
+            # 预先收集每个类别的所有图像路径
+            class_image_paths = [[] for _ in range(num_classes)]
             for class_idx, class_name in enumerate(subdirs):
                 class_dir = os.path.join(data_path, class_name)
-                img_files = [f for f in os.listdir(class_dir)
-                             if f.endswith(('.jpg', '.png', '.jpeg'))]
+                img_files = [f for f in os.listdir(class_dir) if f.endswith(('.jpg', '.png', '.jpeg'))]
+                class_image_paths[class_idx] = [os.path.join(class_dir, f) for f in img_files]
 
-                if num_samples:
-                    per_class = num_samples // len(subdirs) + 1
+            # ========== 采样策略 ==========
+            if imbalance_ratio is not None and imbalance_ratio > 0:
+                # 长尾采样
+                head_max = head_samples if head_samples else 200
+                class_counts = []
+                for i in range(num_classes):
+                    ratio = imbalance_ratio ** (i / (num_classes - 1))
+                    count = max(1, int(head_max * ratio))
+                    class_counts.append(count)
+
+                for c in range(num_classes):
+                    available = len(class_image_paths[c])
+                    if available < class_counts[c]:
+                        st.warning(f"类别 {class_names[c]} 原始样本不足（需要 {class_counts[c]}，实际 {available}），使用全部 {available} 个")
+                        class_counts[c] = available
+            else:
+                # 普通采样
+                if num_samples is None:
+                    class_counts = [len(class_image_paths[c]) for c in range(num_classes)]
                 else:
-                    per_class = len(img_files)
+                    per_class = num_samples // num_classes + 1
+                    class_counts = [min(per_class, len(class_image_paths[c])) for c in range(num_classes)]
+                    total = sum(class_counts)
+                    if total > num_samples:
+                        diff = total - num_samples
+                        for c in range(num_classes - 1, -1, -1):  # 从尾部开始减少
+                            if diff <= 0:
+                                break
+                            reduce = min(diff, class_counts[c] - 1)
+                            class_counts[c] -= reduce
+                            diff -= reduce
 
-                for img_file in img_files[:per_class]:
-                    img_path = os.path.join(class_dir, img_file)
+            # 采样
+            for c in range(num_classes):
+                paths = class_image_paths[c]
+                count = class_counts[c]
+                if count <= 0:
+                    continue
+                selected_paths = np.random.choice(paths, count, replace=False) if count < len(paths) else paths
+                for img_path in selected_paths:
                     try:
                         img = Image.open(img_path).convert('RGB')
                         img = transforms.Resize((224, 224))(img)
                         img = transforms.ToTensor()(img)
                         samples.append({
-                            'id': f'animal_{class_idx}_{img_file}',
+                            'id': f'animal_{c}_{os.path.basename(img_path)}',
                             'image': img,
-                            'class_name': class_name
+                            'class_name': class_names[c]
                         })
-                        labels_noisy.append(class_idx)
-                        labels_true.append(class_idx)
+                        labels_noisy.append(c)
+                        labels_true.append(c)
                     except:
                         continue
 
-                    if num_samples and len(samples) >= num_samples:
-                        break
-                if num_samples and len(samples) >= num_samples:
-                    break
+            total_samples = len(samples)
+            if imbalance_ratio:
+                st.info(f"长尾采样完成，总样本数: {total_samples}，不平衡率: {imbalance_ratio:.3f}")
+            else:
+                st.info(f"随机采样完成，总样本数: {total_samples}")
         else:
             st.warning(f"Animal-10N 数据不存在: {data_path}，使用模拟数据")
             class_names = ['dog', 'cat', 'horse', 'sheep', 'cow', 'elephant',
                            'bear', 'zebra', 'giraffe', 'pig']
-            for i in range(num_samples or 200):
-                class_idx = i % len(class_names)
-                samples.append({
-                    'id': f'animal_{i:05d}',
-                    'image': torch.randn(3, 224, 224),
-                    'class_name': class_names[class_idx]
-                })
-                labels_noisy.append(class_idx)
-                labels_true.append(class_idx)
+            num_classes = len(class_names)
+            if imbalance_ratio is not None:
+                # 模拟长尾采样
+                head_max = head_samples if head_samples else 200
+                class_counts = []
+                for i in range(num_classes):
+                    ratio = imbalance_ratio ** (i / (num_classes - 1))
+                    count = max(1, int(head_max * ratio))
+                    class_counts.append(count)
+            else:
+                if num_samples:
+                    per_class = num_samples // num_classes + 1
+                    class_counts = [per_class] * num_classes
+                else:
+                    class_counts = [200] * num_classes
+
+            for class_idx, count in enumerate(class_counts):
+                for j in range(count):
+                    samples.append({
+                        'id': f'animal_{class_idx}_{j:04d}',
+                        'image': torch.randn(3, 224, 224),
+                        'class_name': class_names[class_idx]
+                    })
+                    labels_noisy.append(class_idx)
+                    labels_true.append(class_idx)
 
         return samples, np.array(labels_noisy), np.array(labels_true), class_names
 
@@ -244,7 +341,6 @@ class DatasetLoader:
 def generate_synthetic_data(num_samples=200, num_classes=10, imbalance=0.1, noise_rate=0.2):
     """生成模拟长尾噪声数据"""
     class_names = [f'Class_{i}' for i in range(num_classes)]
-
     samples = []
     true_labels = []
 
@@ -258,7 +354,6 @@ def generate_synthetic_data(num_samples=200, num_classes=10, imbalance=0.1, nois
     total = sum(class_counts)
     scale = num_samples / total
     class_counts = [max(1, int(c * scale)) for c in class_counts]
-
     diff = num_samples - sum(class_counts)
     if diff > 0:
         for i in range(min(diff, num_classes)):
@@ -277,7 +372,6 @@ def generate_synthetic_data(num_samples=200, num_classes=10, imbalance=0.1, nois
     noisy_labels = true_labels.copy()
     num_noisy = int(num_samples * noise_rate)
     noisy_indices = np.random.choice(num_samples, num_noisy, replace=False)
-
     for idx in noisy_indices:
         current = true_labels[idx]
         other_classes = [c for c in range(num_classes) if c != current]
@@ -288,20 +382,15 @@ def generate_synthetic_data(num_samples=200, num_classes=10, imbalance=0.1, nois
 
 
 # ==================== TABASCO 噪声检测器 ====================
-from sklearn.mixture import GaussianMixture
 
 class TABASCODetector:
-    """TABASCO 两阶段样本选择 - 完整实现"""
-
     def __init__(self, num_classes):
         self.num_classes = num_classes
 
     def compute_wjsd(self, probabilities, labels):
-        """加权JS散度"""
         n_samples = len(probabilities)
         wjsd_scores = np.zeros(n_samples)
 
-        # 计算各类别平均预测分布
         class_avg = []
         for c in range(self.num_classes):
             mask = labels == c
@@ -326,11 +415,9 @@ class TABASCODetector:
         return wjsd_scores
 
     def compute_acd(self, features, labels, confidences):
-        """自适应质心距离"""
         n_samples = len(features)
         acd_scores = np.zeros(n_samples)
 
-        # 计算各类别质心
         class_centroids = []
         for c in range(self.num_classes):
             mask = labels == c
@@ -361,28 +448,19 @@ class TABASCODetector:
         return acd_scores
 
     def _dimension_selection(self, wjsd_scores, acd_scores):
-        """
-        维度选择策略（完整实现）
-        返回: 选定的分数数组, 是否使用WJSD的标志
-        """
-        # 使用GMM基于WJSD聚簇，得到分离阈值d
+        """完整维度选择策略（基于GMM）"""
         wjsd_reshaped = wjsd_scores.reshape(-1, 1)
         gmm_wjsd = GaussianMixture(n_components=2, random_state=42)
         gmm_wjsd.fit(wjsd_reshaped)
-
-        # 获取两个簇的均值，计算分离阈值d（两个簇均值的中点）
         means_wjsd = gmm_wjsd.means_.flatten()
         d = (means_wjsd[0] + means_wjsd[1]) / 2
 
-        # 使用GMM基于ACD聚簇
         acd_reshaped = acd_scores.reshape(-1, 1)
         gmm_acd = GaussianMixture(n_components=2, random_state=42)
         cluster_labels_acd = gmm_acd.fit_predict(acd_reshaped)
 
-        # 计算ACD两个簇在WJSD维度上的均值和方差
         cluster0_mask = (cluster_labels_acd == 0)
         cluster1_mask = (cluster_labels_acd == 1)
-
         wjsd_cluster0 = wjsd_scores[cluster0_mask]
         wjsd_cluster1 = wjsd_scores[cluster1_mask]
 
@@ -391,38 +469,24 @@ class TABASCODetector:
         sigma1 = wjsd_cluster0.std() if len(wjsd_cluster0) > 0 else np.inf
         sigma2 = wjsd_cluster1.std() if len(wjsd_cluster1) > 0 else np.inf
 
-        # 维度选择规则（参考TABASCO原论文算法1）
-        eta = 0.5  # 预设阈值
-
-        # 情况1：一个簇的均值小于d，另一个大于d，且方差比满足条件
+        eta = 0.5
         if (mu1 < d < mu2 or mu2 < d < mu1) and (sigma2 / sigma1 < eta or sigma1 / sigma2 < eta):
-            return wjsd_scores, True   # 选择WJSD
-
-        # 情况2：两个簇的均值都大于d（尾部类别情况）
+            return wjsd_scores, True
         if mu1 > d and mu2 > d:
-            return wjsd_scores, True   # 选择WJSD
-
-        # 其他情况：选择ACD
+            return wjsd_scores, True
         return acd_scores, False
 
     def detect(self, probabilities, features, labels, confidences):
-        """
-        两阶段样本选择 - 完整检测流程
-        返回: sample_types (0=高可信, 1=低可信, 2=疑似噪声), wjsd, acd
-        """
         n_samples = len(labels)
 
-        # ========== 第一阶段：计算双度量 ==========
         wjsd = self.compute_wjsd(probabilities, labels)
         acd = self.compute_acd(features, labels, confidences)
 
-        # 归一化到[0,1]区间
         wjsd = (wjsd - wjsd.min()) / (wjsd.max() - wjsd.min() + 1e-8)
         acd = (acd - acd.min()) / (acd.max() - acd.min() + 1e-8)
 
         sample_types = np.zeros(n_samples, dtype=int)
 
-        # ========== 第二阶段：对每个类别独立处理 ==========
         for c in range(self.num_classes):
             mask = labels == c
             if mask.sum() == 0:
@@ -432,46 +496,35 @@ class TABASCODetector:
             c_wjsd = wjsd[idx]
             c_acd = acd[idx]
 
-            # ----- 步骤1：维度选择 -----
             scores, use_wjsd = self._dimension_selection(c_wjsd, c_acd)
 
-            # ----- 步骤2：GMM聚簇选择 -----
             scores_reshaped = scores.reshape(-1, 1)
             gmm = GaussianMixture(n_components=2, random_state=42)
             cluster_labels = gmm.fit_predict(scores_reshaped)
 
-            # 计算两个簇的平均分数
             mean0 = scores[cluster_labels == 0].mean() if np.sum(cluster_labels == 0) > 0 else np.inf
             mean1 = scores[cluster_labels == 1].mean() if np.sum(cluster_labels == 1) > 0 else np.inf
-
-            # 判断干净簇（平均分数较小的簇）
             clean_cluster = 0 if mean0 < mean1 else 1
 
-            # ----- 步骤3：样本分类 -----
-            # 获取干净簇内的分数
             clean_mask = (cluster_labels == clean_cluster)
             clean_scores = scores[clean_mask]
 
             if len(clean_scores) > 0:
-                # 计算干净簇内的25%分位数
                 q25_clean = np.percentile(clean_scores, 25)
-
                 for i, pos in enumerate(idx):
                     if cluster_labels[i] == clean_cluster:
-                        # 干净簇内：低于25%分位数为高可信，其余为低可信
                         if scores[i] <= q25_clean:
-                            sample_types[pos] = 0      # 高可信
+                            sample_types[pos] = 0
                         else:
-                            sample_types[pos] = 1      # 低可信
+                            sample_types[pos] = 1
                     else:
-                        # 噪声簇内：全部为疑似噪声
-                        sample_types[pos] = 2          # 疑似噪声
+                        sample_types[pos] = 2
             else:
-                # 干净簇为空（异常情况），全部标为低可信
                 for pos in idx:
                     sample_types[pos] = 1
 
         return sample_types, wjsd, acd
+
 
 # ==================== 模型管理 ====================
 
@@ -483,7 +536,6 @@ class RealModelManager:
 
     def load_model(self, model_name='resnet18', num_classes=10):
         self.model_name = model_name
-
         if model_name == 'resnet18':
             self.model = torchvision.models.resnet18(pretrained=False)
         elif model_name == 'resnet34':
@@ -514,7 +566,6 @@ class RealModelManager:
         self.model.fc = torch.nn.Linear(in_features, num_classes)
         self.model = self.model.to(self.device)
         self.model.eval()
-
         return self.model
 
     def extract_features(self, images):
@@ -525,7 +576,6 @@ class RealModelManager:
                 if img.shape[1] <= 32:
                     img = transforms.Resize(224)(img)
                 img = img.unsqueeze(0).to(self.device)
-
                 x = self.model.conv1(img)
                 x = self.model.bn1(x)
                 x = self.model.relu(x)
@@ -547,12 +597,10 @@ class RealModelManager:
                 if img.shape[1] <= 32:
                     img = transforms.Resize(224)(img)
                 img = img.unsqueeze(0).to(self.device)
-
                 output = self.model(img)
                 probs = torch.softmax(output, dim=1).cpu().numpy()[0]
                 pred = np.argmax(probs)
                 conf = probs[pred]
-
                 probs_list.append(probs)
                 preds_list.append(pred)
                 confs_list.append(conf)
@@ -579,7 +627,6 @@ def plot_class_distribution(labels, class_names, max_display=20):
     else:
         display_names = class_names
         counts = [counter.get(i, 0) for i in range(len(class_names))]
-
     fig = go.Figure()
     fig.add_trace(go.Bar(x=display_names, y=counts, marker_color='#1E88E5', text=counts, textposition='auto'))
     fig.update_layout(title="类别分布", xaxis_tickangle=-45, height=500)
@@ -590,30 +637,24 @@ def plot_sample_type_distribution(sample_types, labels, class_names, max_display
         fig = go.Figure()
         fig.update_layout(title="各类别样本类型分布（暂无数据）", height=500)
         return fig
-
     if len(sample_types) != len(labels):
         min_len = min(len(sample_types), len(labels))
         sample_types = sample_types[:min_len]
         labels = labels[:min_len]
-
     if len(sample_types) == 0:
         fig = go.Figure()
         fig.update_layout(title="各类别样本类型分布（无数据）", height=500)
         return fig
-
     type_names = ['高可信', '低可信', '疑似噪声']
     colors = ['#4caf50', '#ff9800', '#f44336']
-
     if len(class_names) > max_display:
         display_names = class_names[:max_display]
     else:
         display_names = class_names
-
     data = []
     for i in range(3):
         counts = [np.sum((labels == c) & (sample_types == i)) for c in range(len(display_names))]
         data.append(go.Bar(name=type_names[i], x=display_names, y=counts, marker_color=colors[i]))
-
     fig = go.Figure(data=data)
     fig.update_layout(title="各类别样本类型分布", barmode='stack', xaxis_tickangle=-45, height=500)
     return fig
@@ -639,7 +680,6 @@ def plot_confusion_matrix(true_labels, pred_labels, class_names, max_display=15)
         display_names = class_names
         true_display = true_labels
         pred_display = pred_labels
-
     cm = confusion_matrix(true_display, pred_display)
     cm_norm = cm.astype('float') / (cm.sum(axis=1, keepdims=True) + 1e-8)
     fig = px.imshow(cm_norm, x=display_names, y=display_names,
@@ -670,31 +710,31 @@ def main():
             "CIFAR-10-LT (模拟)"
         ])
 
-        st.markdown("### 📊 样本数量")
-        sample_mode = st.radio("选择模式", ["指定数量", "全部数据"], horizontal=True)
-
-        if sample_mode == "指定数量":
-            num_samples = st.number_input(
-                "样本数量",
-                min_value=10,
-                max_value=50000,
-                value=200,
-                step=50,
-                help="输入要使用的样本数量，最大50000"
-            )
-            num_samples = int(num_samples)
-        else:
-            num_samples = None
-            st.info("将使用数据集的全部样本")
-
+        # ==================== CIFAR-10N ====================
         if dataset_type == "CIFAR-10N (真实噪声)":
             noise_type = st.selectbox("噪声类型", ["worst", "aggregate", "random1", "random2", "random3"])
+
+            enable_longtail = st.checkbox("构造长尾分布（按不平衡率采样）", value=False)
+            if enable_longtail:
+                imbalance_ratio = st.slider("不平衡率 (尾部/头部样本比例)", 0.01, 0.5, 0.1, 0.01)
+                head_samples = st.number_input("头部类别采样数量", min_value=10, max_value=5000, value=1000)
+                num_samples = None
+            else:
+                imbalance_ratio = None
+                head_samples = None
+                sample_mode = st.radio("选择模式", ["指定数量", "全部数据"], horizontal=True)
+                if sample_mode == "指定数量":
+                    num_samples = st.number_input("样本数量", min_value=10, max_value=50000, value=200, step=50)
+                else:
+                    num_samples = None
 
             if st.button("加载数据集", type="primary"):
                 with st.spinner("加载 CIFAR-10N..."):
                     result = DatasetLoader.load_cifar10n(
                         num_samples=num_samples,
-                        noise_type=noise_type
+                        noise_type=noise_type,
+                        imbalance_ratio=imbalance_ratio if enable_longtail else None,
+                        head_samples=head_samples if enable_longtail else None
                     )
                     if result[0] is not None:
                         samples, labels_noisy, labels_true, class_names = result
@@ -710,12 +750,32 @@ def main():
                         st.session_state.features = None
                         st.success(f"✅ 加载完成: {len(samples)} 样本, {len(class_names)} 类别")
 
+        # ==================== CIFAR-100N ====================
         elif dataset_type == "CIFAR-100N (真实噪声)":
+            enable_longtail = st.checkbox("构造长尾分布（按不平衡率采样）", value=False)
+            if enable_longtail:
+                imbalance_ratio = st.slider("不平衡率 (尾部/头部样本比例)", 0.01, 0.5, 0.1, 0.01)
+                head_samples = st.number_input("头部类别采样数量", min_value=10, max_value=3000, value=500)
+                num_samples = None
+            else:
+                imbalance_ratio = None
+                head_samples = None
+                sample_mode = st.radio("选择模式", ["指定数量", "全部数据"], horizontal=True)
+                if sample_mode == "指定数量":
+                    num_samples = st.number_input("样本数量", min_value=10, max_value=50000, value=200, step=50)
+                else:
+                    num_samples = None
+
             if st.button("加载数据集", type="primary"):
                 with st.spinner("加载 CIFAR-100N..."):
-                    result = DatasetLoader.load_cifar100n(num_samples=num_samples)
+                    result = DatasetLoader.load_cifar100n(
+                        num_samples=num_samples,
+                        imbalance_ratio=imbalance_ratio if enable_longtail else None,
+                        head_samples=head_samples if enable_longtail else None
+                    )
                     if result[0] is not None:
                         samples, labels_noisy, labels_true, class_names = result
+                        st.session_state.clear()
                         st.session_state.samples = samples
                         st.session_state.labels = labels_noisy
                         st.session_state.true_labels = labels_true
@@ -724,14 +784,35 @@ def main():
                         st.session_state.predictions = None
                         st.session_state.confidences = None
                         st.session_state.sample_types = None
+                        st.session_state.features = None
                         st.success(f"✅ 加载完成: {len(samples)} 样本, {len(class_names)} 类别")
 
+        # ==================== Animal-10N ====================
         elif dataset_type == "Animal-10N (真实噪声)":
+            enable_longtail = st.checkbox("构造长尾分布（按不平衡率采样）", value=False)
+            if enable_longtail:
+                imbalance_ratio = st.slider("不平衡率 (尾部/头部样本比例)", 0.01, 0.5, 0.1, 0.01)
+                head_samples = st.number_input("头部类别采样数量", min_value=10, max_value=1000, value=200)
+                num_samples = None
+            else:
+                imbalance_ratio = None
+                head_samples = None
+                sample_mode = st.radio("选择模式", ["指定数量", "全部数据"], horizontal=True)
+                if sample_mode == "指定数量":
+                    num_samples = st.number_input("样本数量", min_value=10, max_value=50000, value=200, step=50)
+                else:
+                    num_samples = None
+
             if st.button("加载数据集", type="primary"):
                 with st.spinner("加载 Animal-10N..."):
-                    result = DatasetLoader.load_animal10n(num_samples=num_samples)
+                    result = DatasetLoader.load_animal10n(
+                        num_samples=num_samples,
+                        imbalance_ratio=imbalance_ratio if enable_longtail else None,
+                        head_samples=head_samples if enable_longtail else None
+                    )
                     if result[0] is not None:
                         samples, labels_noisy, labels_true, class_names = result
+                        st.session_state.clear()
                         st.session_state.samples = samples
                         st.session_state.labels = labels_noisy
                         st.session_state.true_labels = labels_true
@@ -740,18 +821,23 @@ def main():
                         st.session_state.predictions = None
                         st.session_state.confidences = None
                         st.session_state.sample_types = None
+                        st.session_state.features = None
                         st.success(f"✅ 加载完成: {len(samples)} 样本, {len(class_names)} 类别")
 
+        # ==================== 模拟数据 ====================
         else:
             num_classes = st.number_input("类别数量", 2, 50, 10)
             imbalance = st.slider("长尾不平衡率", 0.05, 0.5, 0.1, 0.05)
             noise_rate = st.slider("噪声率", 0.0, 0.5, 0.2, 0.05)
-
+            sample_mode = st.radio("选择模式", ["指定数量", "全部数据"], horizontal=True)
+            if sample_mode == "指定数量":
+                num_samples = st.number_input("样本数量", min_value=10, max_value=50000, value=200, step=50)
+            else:
+                num_samples = 200
             if st.button("生成数据集", type="primary"):
                 with st.spinner("生成模拟数据..."):
                     samples, labels_noisy, labels_true, class_names = generate_synthetic_data(
-                        num_samples if num_samples else 200,
-                        num_classes, imbalance, noise_rate
+                        num_samples, num_classes, imbalance, noise_rate
                     )
                     st.session_state.samples = samples
                     st.session_state.labels = labels_noisy
@@ -792,7 +878,7 @@ def main():
 
                     st.success(f"✅ 检测完成: 高可信:{sum(types==0)} 低可信:{sum(types==1)} 疑似噪声:{sum(types==2)}")
 
-    # 主内容区
+    # 主内容区（省略详细代码以节省篇幅，实际使用时需保留完整内容）
     if st.session_state.samples is None:
         st.info("👈 请选择数据集并点击加载")
         return
@@ -850,7 +936,6 @@ def main():
             page = st.number_input("页码", 1, total_pages, 1)
             start, end = (page-1)*per_page, min(page*per_page, len(indices))
 
-            # 显示当前样本
             for idx in indices[start:end]:
                 type_name = ["高可信", "低可信", "疑似噪声"][st.session_state.sample_types[idx]]
                 color = {"高可信":"green", "低可信":"orange", "疑似噪声":"red"}[type_name]
@@ -872,116 +957,76 @@ def main():
                         st.rerun()
                 st.markdown('</div>', unsafe_allow_html=True)
 
-            # ========== 修复：批量操作区域 ==========
-            st.markdown("---")
-            st.subheader("批量操作")
-
             col1, col2 = st.columns(2)
-
             with col1:
-                # 修复：先检查再操作，操作后只显示成功消息，不自动刷新
                 if st.button("将所有疑似噪声改为预测标签"):
                     if st.session_state.predictions is not None:
                         noise_indices = np.where(st.session_state.sample_types == 2)[0]
                         if len(noise_indices) > 0:
                             modified_count = 0
                             for idx in noise_indices:
-                                # 确保索引在范围内
                                 if idx < len(st.session_state.modified_labels) and idx < len(st.session_state.predictions):
                                     old_label = st.session_state.modified_labels[idx]
                                     new_label = st.session_state.predictions[idx]
                                     st.session_state.modified_labels[idx] = new_label
                                     if old_label != new_label:
                                         modified_count += 1
-
-                            # 使用临时消息而不是 rerun，避免状态丢失
                             st.toast(f"✅ 已将 {modified_count} 个疑似噪声样本改为预测标签", icon="✅")
-                            # 注意：这里不用 st.rerun()，让页面自然更新
                         else:
                             st.warning("没有疑似噪声样本")
                     else:
                         st.warning("预测标签为空，请先运行检测")
-
             with col2:
                 if st.button("重置所有修改"):
-                    # 修复：使用原始标签的副本，而不是引用
                     st.session_state.modified_labels = st.session_state.labels.copy()
                     st.toast("✅ 已重置所有修改", icon="🔄")
-                    # 同样不自动刷新
-
-            # 添加一个手动刷新按钮，让用户控制
-            if st.button("🔄 刷新页面", key="refresh_btn"):
-                st.rerun()
 
             st.markdown("---")
-
-            # 导出结果区域
             st.subheader("📥 导出分析结果")
-
-            # 修复：导出时重新构建 DataFrame，确保使用最新的 modified_labels
             if st.button("生成导出文件", key="export_btn"):
                 sample_ids = [s['id'] for s in st.session_state.samples]
-
-                # 确保所有数组长度一致
                 n_samples = len(sample_ids)
-
-                # 安全获取真实标签
                 if st.session_state.true_labels is not None:
                     true_labels_str = [st.session_state.class_names[l] for l in st.session_state.true_labels[:n_samples]]
                     is_noise = [st.session_state.labels[i] != st.session_state.true_labels[i] for i in range(n_samples)]
                 else:
                     true_labels_str = [None] * n_samples
                     is_noise = [False] * n_samples
-
-                # 当前标签（原始噪声标签）
                 current_labels = [st.session_state.class_names[l] for l in st.session_state.labels[:n_samples]]
-
-                # 修改后标签（已包含用户的所有修改）
                 modified_labels = [st.session_state.class_names[l] for l in st.session_state.modified_labels[:n_samples]]
-
-                # 预测标签
                 if st.session_state.predictions is not None:
                     pred_labels = [st.session_state.class_names[p] for p in st.session_state.predictions[:n_samples]]
+                    pred_correct = [pred_labels[i] == true_labels_str[i] for i in range(n_samples)]
+                    pred_correct_str = ['是' if x else '否' for x in pred_correct]
                 else:
                     pred_labels = [None] * n_samples
-
-                # 置信度
+                    pred_correct_str = [None] * n_samples
                 if st.session_state.confidences is not None:
                     confs = st.session_state.confidences[:n_samples]
                 else:
                     confs = [None] * n_samples
-
-                # 样本类型
                 if st.session_state.sample_types is not None:
                     sample_types_str = [['高可信', '低可信', '疑似噪声'][t] for t in st.session_state.sample_types[:n_samples]]
                 else:
                     sample_types_str = [None] * n_samples
-
-                # 修改是否正确（仅当有真实标签时）
                 if st.session_state.true_labels is not None:
-                    correction_correct = [st.session_state.modified_labels[i] == st.session_state.true_labels[i]
-                                          for i in range(n_samples)]
+                    correction_correct = [st.session_state.modified_labels[i] == st.session_state.true_labels[i] for i in range(n_samples)]
                 else:
                     correction_correct = [False] * n_samples
-
-                # 构建 DataFrame
                 df = pd.DataFrame({
                     '样本ID': sample_ids,
                     '真实标签': true_labels_str,
                     '原始噪声标签': current_labels,
                     '修改后标签': modified_labels,
                     '预测标签': pred_labels,
+                    '预测是否正确': pred_correct_str,
                     '置信度': confs,
                     '样本类型': sample_types_str,
                     '原始是否为噪声': ['是' if x else '否' for x in is_noise],
                     '修改是否正确': ['是' if x else '否' for x in correction_correct]
                 })
-
-                # 保存到 session_state 供下载使用
                 st.session_state.export_df = df
                 st.success(f"✅ 已生成 {len(df)} 条记录，请点击下方按钮下载")
-
-            # 下载按钮（独立于生成按钮）
             if st.session_state.get('export_df') is not None:
                 csv = st.session_state.export_df.to_csv(index=False, encoding='utf-8-sig').encode()
                 st.download_button(
