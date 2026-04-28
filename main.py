@@ -20,6 +20,7 @@ from collections import Counter
 from scipy.special import rel_entr
 from sklearn.metrics import confusion_matrix
 from sklearn.mixture import GaussianMixture
+from sklearn.decomposition import PCA
 from PIL import Image
 import requests
 
@@ -686,7 +687,59 @@ def plot_confusion_matrix(true_labels, pred_labels, class_names, max_display=15)
                     text_auto='.2f', color_continuous_scale='Blues', aspect="auto")
     fig.update_layout(title="混淆矩阵", height=500)
     return fig
+def plot_feature_visualization(features, sample_types, labels, class_names, max_display=500):
+    """
+    特征空间可视化：使用 PCA 将高维特征降维到二维，用散点图展示。
+    """
+    if features is None or len(features) == 0:
+        fig = go.Figure()
+        fig.update_layout(title="特征空间可视化（暂无特征数据）", height=500)
+        return fig
 
+    # 如果样本过多，随机采样
+    n_samples = len(features)
+    if n_samples > max_display:
+        indices = np.random.choice(n_samples, max_display, replace=False)
+        features = features[indices]
+        sample_types = sample_types[indices] if sample_types is not None else None
+        labels = labels[indices]
+
+    # PCA 降维
+    pca = PCA(n_components=2)
+    features_2d = pca.fit_transform(features)
+
+    # 准备数据框
+    type_names = ['高可信', '低可信', '疑似噪声']
+    sample_type_str = [type_names[t] for t in sample_types] if sample_types is not None else ['未知'] * len(features)
+    class_names_str = [class_names[l] if l < len(class_names) else str(l) for l in labels]
+
+    df = pd.DataFrame({
+        'PC1': features_2d[:, 0],
+        'PC2': features_2d[:, 1],
+        '样本类型': sample_type_str,
+        '类别': class_names_str
+    })
+
+    # 绘制散点图
+    fig = px.scatter(
+        df, x='PC1', y='PC2',
+        color='样本类型',
+        symbol='类别',
+        title=f'特征空间PCA可视化 (解释方差: {pca.explained_variance_ratio_[0]:.2%}, {pca.explained_variance_ratio_[1]:.2%})',
+        color_discrete_map={'高可信': '#4caf50', '低可信': '#ff9800', '疑似噪声': '#f44336'}
+    )
+    fig.update_layout(
+        height=500,
+        legend=dict(
+            orientation='h',
+            yanchor='bottom',
+            y=1.02,
+            xanchor='center',
+            x=0.5
+        ),
+        margin=dict(t=80)
+    )
+    return fig
 
 # ==================== 主程序 ====================
 
@@ -872,6 +925,7 @@ def main():
                     detector = TABASCODetector(num_c)
                     types, wjsd, acd = detector.detect(probs, features, st.session_state.labels, confs)
 
+                    st.session_state.features = features
                     st.session_state.predictions = preds
                     st.session_state.confidences = confs
                     st.session_state.sample_types = types
@@ -902,8 +956,39 @@ def main():
 
     with tab2:
         if st.session_state.sample_types is not None:
-            st.plotly_chart(plot_sample_type_distribution(st.session_state.sample_types, st.session_state.labels, st.session_state.class_names), use_container_width=True)
-            st.plotly_chart(plot_confidence_distribution(st.session_state.confidences, st.session_state.sample_types), use_container_width=True)
+            # 各类别样本类型分布图
+            st.plotly_chart(
+                plot_sample_type_distribution(
+                    st.session_state.sample_types,
+                    st.session_state.labels,
+                    st.session_state.class_names
+                ),
+                use_container_width=True
+            )
+
+            # 置信度分布图
+            st.plotly_chart(
+                plot_confidence_distribution(
+                    st.session_state.confidences,
+                    st.session_state.sample_types
+                ),
+                use_container_width=True
+            )
+
+            # 特征空间可视化（新增）
+            st.markdown("### 特征空间可视化")
+            if st.session_state.features is not None:
+                st.plotly_chart(
+                    plot_feature_visualization(
+                        st.session_state.features,
+                        st.session_state.sample_types,
+                        st.session_state.labels,
+                        st.session_state.class_names
+                    ),
+                    use_container_width=True
+                )
+            else:
+                st.info("特征数据为空，请先运行检测")
         else:
             st.info("请先运行检测")
 
